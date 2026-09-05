@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.DocumentRevisions-V100
+.fseventsd
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Icon[
+]
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Thumbnails
+._*
+
+# Generated symlink farm — manage-skills.py deletes and recreates active/ on
+# every run (link.symlink_to(skill_path.resolve()), i.e. absolute, per-machine
+# paths). Derived state, not source: regenerate with `./manage-skills.py`.
+active/
+
+# Python (manage-skills.py)
+__pycache__/
+*.py[cod]
