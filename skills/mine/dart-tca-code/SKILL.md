@@ -54,6 +54,10 @@ extension TodayStateDerived on TodayState {
 
 Case names derive from type-parameter names, so cases called `Error`/`Internal`/`Destination` shadow real types and need `// ignore_for_file: avoid_types_as_parameter_names`. Put it **above** the `///` library doc comment, or the doc comment detaches from `library;`.
 
+### Sub-enum case cap
+
+Upstream `case_key_path_generator.dart` indexes `const letters = ["A"…"I"]` by type-parameter position, so a **10th case fails codegen** with `RangeError (length): Invalid value: Not in inclusive range 0..8: 9` — naming neither the class nor the cause, while build_runner still reports "wrote N outputs". Extending `letters` to the full alphabet is a one-line fix if you control the package. Either way, past ~6 cases split the sub-enum into cohesive groups (each its own `@CaseKeyPathable` class) and fan out per group in the reducer.
+
 ### What actually gets generated
 
 Per `@KeyPathable`: `mixin _$X` (copyWith / `==` via `DeepCollectionEquality` / hashCode / toString) + `extension XPath` (a `WritableKeyPath` per field).
@@ -77,6 +81,13 @@ Give every domain and DTO model `==`/`hashCode` covering every field, deep for c
 | `Effect.merge` order is unspecified | With 3+ effects, later-listed ones can arrive first. Never write a test that depends on order unless verified for that shape |
 | `onError:` re-emits the raw error after converting it | Surfaces as an unhandled zone error even though the action was delivered. Wrap the send in `runZonedGuarded` and assert on it, or try/catch inside the effect body instead |
 | `Effect.async`/`Effect.sync` unused in practice | Call synchronous side effects inline in the reducer body |
+
+### `Store.dispose()` does not cancel effect subscriptions
+
+It only calls `_onDispose`. Combined with globally-keyed cancellation (below), **a long-lived `Effect.stream` can never be stopped safely** — it outlives the screen that started it.
+
+- Stream is fine only for an effect meant to live as long as the app.
+- For a finite long-lived effect (countdown, polling, retry), use a **self-terminating chain of one-shot effects** latched by a state flag, with every exit funnelling through one `_halt` that lowers the latch. Assert the **count of armed waits**, not the flag: a duplicate chain sets the same flag and just runs twice as fast.
 
 ### Cancellation is globally keyed and leaks
 
@@ -104,6 +115,10 @@ sut.store.verifyNoPendingActions();
 ### Failures surface as unhandled zone errors
 
 The action check runs inside `stream.listen`, so an `UnexpectedAction` throw is **not** caught by the enclosing `try` or by `expect`. It is often attributed to whichever test was running. Suspect a mismatched action before suspecting the test you are looking at.
+
+### `TestStore` has no `state` getter
+
+Only `Store` does. Every assertion must live inside the exhaustive `send`/`receive` closures.
 
 ### Expected-state closure must return a new instance
 

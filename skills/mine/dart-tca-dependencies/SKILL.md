@@ -1,11 +1,13 @@
 ---
 name: dart-tca-dependencies
-description: Use when adding or modifying dependency clients in a Dart TCA project — struct-of-closures clients, the DependencyValues registry, zone-scoped withDependencies overrides, or wiring a new service for reducers and tests.
+description: Use when adding or modifying dependency clients in a Dart TCA project — struct-of-closures clients, the DependencyValues registry, zone-scoped withDependencies overrides, controllable date/clock/uuid clients, or wiring a new service for reducers and tests.
 ---
 
 # Dependency clients & zone-scoped injection
 
-The Dart analog of Swift TCA's `@DependencyClient` + `@Dependency` + `withDependencies`. Two libraries own the pattern: a *clients* library (one struct-of-closures per service) and a *dependency values* library (the ambient registry + zone plumbing). Companion skills: dart-tca (reducers/effects), dart-testing-sut (spy clients in tests).
+The Dart analog of Swift TCA's `@DependencyClient` + `@Dependency` + `withDependencies`. Two libraries own the pattern: a *clients* library (one struct-of-closures per service) and a *dependency values* library (the ambient registry + zone plumbing).
+
+Reading a client from a reducer: `dart-tca-reducer`. Spies and overrides in tests: `dart-tca-testing`.
 
 ## Clients: struct-of-closures
 
@@ -150,7 +152,7 @@ App startup — install real/demo wiring once:
 rootDependencies = demoDependencies(); // a DependencyValues with benign closures
 ```
 
-Test side — overrides are zone-scoped, so the zone must stay alive across every `send`/`await` (see the dart-testing-sut skill for the full factory pattern):
+Test side — overrides are zone-scoped, so the zone must stay alive across every `send`/`await` (see `dart-tca-testing` for the full factory pattern):
 
 ```dart
 await withDependencies((d) {

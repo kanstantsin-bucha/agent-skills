@@ -1,91 +1,36 @@
 ---
 name: dart-tca-navigation
-description: Use when a Dart/Flutter TCA feature presents another screen, sheet, modal or alert — designing Action sub-enums (View/Internal/Output/Input), destination enums, IfLet composition, dismissal, Android back, or scoping a child Store in a view.
+description: Use when a Dart/Flutter TCA feature presents another screen, sheet, modal or alert — destination enums, destinationIfLet composition, dismissal ownership, handling a child's Output, sending an Input down — or when a destination compiles but never routes.
 ---
 
-# Dart TCA — actions and destinations
+# Dart TCA — destinations
 
-## Overview
-
-Two rules cover almost every navigation bug in this port:
-
-1. **Actions are split four ways** by *direction of travel* — `View`, `Internal`, `Output`, `Input`.
-2. **Presentation always goes through a destination enum.** Never a bare `Presents<ChildState?>` field.
-
-A child never dismisses itself. It reports what happened; the parent decides.
-
-## The four sub-enums
-
-```dart
-@CaseKeyPathable()
-sealed class TodayAction<
-  View extends TodayView,
-  Internal extends TodayInternal,
-  Output extends TodayOutput //
-> {}
-```
-
-| Sub-enum | Direction | Holds | Present? |
-|---|---|---|---|
-| `XView` | view → reducer | user intent: `checkInTapped`, `appeared` | whenever there is a view |
-| `XInternal` | reducer → itself | effect results; shared step logic several `View` cases funnel into | usually |
-| `XOutput` | child → parent | what happened, for the parent to act on | almost always |
-| `XInput` | parent → child | commands pushed down into a presented child | only when needed |
-
-**A `View` case never runs async work.** It mutates and returns `Effect.none()`, or forwards via `Effect.action(...)` to an `Internal` case that owns the effect. That is what makes one step reusable by several taps.
-
-**A feature's own `Output` case is a no-op in its own reducer** — `case XActionOutput(): return Effect.none();`. It exists only for the parent. Exception: a root feature with no parent.
-
-## Outputs carry no payload
-
-The child writes its result to shared state (its client → repository), then emits a bare marker. The parent reacts and reads the value from state.
-
-```dart
-// WRONG — result travels through the screens
-sealed class SlipLogOutput<SlipLogged extends Temptation> {}
-
-// RIGHT
-sealed class SlipLogOutput<SlipLogged, CancelRequested> {}
-```
-
-Why: one source of truth (a payload is a second copy that can drift); the parent usually re-derives from state anyway; and generated case `==` compares payloads with plain `==`, so a reducer-constructed object can never be matched by `TestStore.receive` — it fails as an unhandled zone error from inside a stream listener.
-
-A payload is fine only for a value the **view** supplied (a tapped id, a typed string) or a primitive.
-
-Name outputs for what happened (`slipLogged`, `cancelRequested`), not a fixed trio. **`failed` is never an output** — a failure is an `Internal` case that presents an error destination.
-
-## Destinations, always
+**Presentation always goes through a destination enum. A child never dismisses itself** — it reports what happened, the parent decides.
 
 ```dart
 @CaseKeyPathable()
 sealed class TodayDestination<
-  SlipLog extends SlipLogState,
-  Milestone extends MilestoneState //
-> {}
+    SlipLog extends SlipLogState,
+    Milestone extends MilestoneState //
+    > {}
 
 @CaseKeyPathable()
 sealed class TodayDestinationAction<
-  SlipLog extends SlipLogAction,
-  Milestone extends MilestoneAction //
-> {}
+    SlipLog extends SlipLogAction,
+    Milestone extends MilestoneAction //
+    > {}
 ```
 
-Two parallel enums, **identical case names in the same order**. One `Presents<XDestination?>` field on state; the state class mixes in `Presentable`.
+Two parallel enums, **identical case names in the same order**. One `Presents<XDestination?>` field on state; the state class mixes in `Presentable` (`dart-tca-state`).
 
-Use a destination enum **even with one child today** — a bare `Presents<ChildState?>` forces a state/action/test rewrite of the parent the moment a second child appears.
-
-The destination case lives at **`internal.destination.<case>`**, never as a fifth top-level action case. Top level stays exactly the four taxonomy words.
-
-```dart
-TodayState({Presents<TodayDestination?>? destination})
-    : destination = destination ?? Presents(null);   // not const; init-list, not a default
-```
-
-`Presents` exists because generated `copyWith` is `?? this.x` and **can never null a plain nullable field**. Present with `copyWith(destination: Presents(TodayDestinationEnum.slipLog(SlipLogState())))`; dismiss with `copyWith(destination: Presents(null))`.
+- Use a destination enum **even with one child today**. A bare `Presents<ChildState?>` forces a rewrite of the parent's state, actions and tests the moment a second child appears.
+- The destination case lives at **`internal.destination.<case>`**, never as a fifth top-level action case. Top level stays exactly the four taxonomy words (`dart-tca-actions`).
+- Present: `copyWith(destination: Presents(TodayDestinationEnum.slipLog(SlipLogState())))`. Dismiss: `copyWith(destination: Presents(null))`.
+- **Auto-dismiss is never wired** (`NavigationDestination`, `Presents` auto-null-on-dispose). It mutates reducer state from a view's dispose callback, inverting the whole design. Every transition is explicit in a reducer.
 
 ## Composition
 
-Confine every key-path hop to one helper. No feature, view or test file calls `.path` or `chainCase`.
+Confine every key-path hop to **one** helper. No feature, view or test file calls `.path` or `chainCase` directly.
 
 ```dart
 Reducer<P, PA> destinationIfLet<P, PA, PI, D, DA, S, A>({
@@ -103,11 +48,11 @@ Reducer<P, PA> destinationIfLet<P, PA, PI, D, DA, S, A>({
     );
 ```
 
-`.path<S?>` needs the **explicit type argument**: the generated case path is already `WritableKeyPath<D, S?>`, and the `Presents` extension otherwise infers a non-null `Deeper` and rejects it.
+`.path<S?>` needs the **explicit type argument**: the generated case path is already `WritableKeyPath<D, S?>`, and the `Presents` extension would otherwise infer a non-null `Deeper` and reject it. That TYPE requirement is the real — and only — reason `.path()` is used here.
 
-State side must use `.path()` — it mutates the `Presents` cell in place, and that reference mutation is what propagates dismissal. `chainCase` alone early-returns the root on null and silently breaks dismissal.
+> **A correction worth knowing.** Earlier revisions justified `.path()` by claiming its in-place `Presents` mutation is what propagates dismissal, and that `chainCase` would break it. That is **wrong in this flow**: swapping in a deliberately-wrong rebuild-the-cell hop left every reducer test passing, dismissal included. The parent nulls the destination in its own `Reduce`, which runs *before* the `IfLet`; the `IfLet` then reads `null` and skips the child. In-place mutation only matters for the auto-dismiss path, which is banned. **No test guards a regression here.**
 
-Bind a per-feature wrapper once (it cannot be generic — `XStatePath.destination` is a static on a generated extension):
+Bind a per-feature wrapper once. It **cannot** be made generic over the parent — `XStatePath.destination` is a static on a generated extension with no interface to abstract over — so this 12-line wrapper is deliberate copy-paste per feature.
 
 ```dart
 Reducer<TodayState, TodayAction> _dest<S, A>(
@@ -121,14 +66,16 @@ Reducer<TodayState, TodayAction> _dest<S, A>(
       stateCase: stateCase, actionCase: actionCase, reducer: reducer,
     );
 
-// build(), in this order: Scopes, own Reduce, then the IfLets
+// build() — Scopes, then own Reduce, then the IfLets. Order matters.
 Reduce.combine([
   Reduce(_reduce),
   _dest(TodayDestinationPath.slipLog, TodayDestinationActionPath.slipLog, SlipLogFeature()),
 ]);
 ```
 
-⚠️ **Nothing type-checks that `stateCase` and `actionCase` name the same case.** Mismatched paths compile and then silently never route. Fails closed, but it is a nasty debugging trap — one `_dest` line per case, names must match. Check in review.
+⚠️ **Nothing type-checks that `stateCase` and `actionCase` name the SAME case.** `_dest(XDestinationPath.slipLog, XDestinationActionPath.milestone, …)` compiles and then silently never routes. It fails closed rather than corrupting state, but it is a nasty debugging trap. One `_dest` line per case; the two path names must match. Check this in review.
+
+For the view side use a `destinationPaths(...)` twin in the same file, returning the `({state, action})` record for `store.view`. `destinationIfLet` delegates to it, so both sides share one implementation.
 
 ## Handling a child's output
 
@@ -144,6 +91,8 @@ case TodayDestinationActionSlipLog(:final slipLog):
   return Effect.none();
 ```
 
+The output is payload-free; the parent re-derives the result from state (`dart-tca-actions`).
+
 ## Sending an Input down
 
 A fully-nested parent action built from generated `…Enum.` factories, routed by the parent's `IfLet`. Never a direct key-path write, never bypassing the reducer.
@@ -154,36 +103,24 @@ store.send(TodayActionEnum.internal(TodayInternalEnum.destination(
         SlipLogActionEnum.input(SlipLogInputEnum.reset())))));
 ```
 
-## View side
+## The one view-side rule that belongs here
 
-- Navigation is a declarative `switch` over `store.state.destination.value`. Never `Navigator.push`, never `NavigationDestination` auto-dispose (it nulls parent state from the view's dispose callback, bypassing the reducer).
-- Modals are a state-driven `Stack` layer (`ModalBarrier(dismissible: false)` + centred `Material`), not `showDialog`.
-- Android back: `PopScope(canPop: false)` + send an action. Defer to a deeper level first: `if (store.state.destination.value != null) return;`.
-- **Never call `store.view(...)` inside `build`** — it leaks a `syncStream` listener per call and nothing disposes it. Memoize the scoped child store in the `State`, drop it on dismissal, null it in `didUpdateWidget` when `!identical(oldWidget.store, widget.store)`.
+⚠️ **`store.view` on a `Presentable` parent silently selects the auto-dismissing overload.** `StorePresentable.view`'s `onDispose` writes `null` into the parent's `destination` — exactly the inversion this design bans.
 
-## The appeared pattern
+**Consequence: never call `dispose()` on a scoped destination store.** Dropping the reference is the only safe teardown, at the cost of one leaked `syncStream` listener per presentation. A `StoreHost` mixin must NOT dispose-all on dismissal. Everything else about presenting in a widget tree is in `dart-tca-view`.
 
-`View.appeared` forwards to `Internal.load` (one-shot) **and** `Internal.observeChanges` (long-lived subscription) as two separate cases, so a re-load never re-subscribes. `observeChanges` must be idempotent:
+## Scaling up
 
-```dart
-case TodayInternalObserveChanges():
-  if (state.value.isObserving) return Effect.none();
-  state.mutate((s) => s.copyWith(isObserving: true));
-  return Effect.stream(() => _challenge.activeChanges().map(_loadedAction));
-```
-
-Not optional: a view re-fires `onAppear` when its store instance changes, and the package's cancellation is globally keyed and unusable as a guard (see dart-tca-code). Without the flag you get a second subscription and every change handled twice.
+A parent that scopes **tabs or siblings** as well as presenting destinations hits three further traps — single-hop `Scope` paths, `dynamic`-instantiated bounds, and transitive-bounds imports (worth 451 analyze errors when missed). Read `references/composing-at-scale.md` **before** writing such a parent, not after.
 
 ## Common mistakes
 
 | Mistake | Symptom |
 |---|---|
 | Bare `Presents<ChildState?>` field | Works until child #2, then a parent rewrite |
-| Destination as a fifth top-level case | Breaks the taxonomy; longer chains elsewhere |
+| Destination as a fifth top-level case | Breaks the taxonomy; longer chains everywhere |
 | Child dismisses itself | Reducer no longer owns navigation; races with the parent |
-| `Output` carries a reducer-built object | `UnexpectedAction` as an unhandled zone error in tests |
-| `chainCase` for the `Presents` hop | Dismissal silently stops working |
-| `.path` without `<S?>` | "argument type `WritableKeyPath<D, S?>` can't be assigned" |
-| `store.view` in `build` | Listener leak per rebuild |
 | `stateCase`/`actionCase` name different cases | Compiles, never routes, no error |
-| `View` case runs an effect | Step logic can't be reused by another tap |
+| `.path` without `<S?>` | "argument type `WritableKeyPath<D, S?>` can't be assigned" |
+| `dispose()` on a scoped destination store | Auto-dismiss overload nulls parent state from a view callback |
+| `Output` carries a reducer-built object | `UnexpectedAction` as an unhandled zone error in tests |
