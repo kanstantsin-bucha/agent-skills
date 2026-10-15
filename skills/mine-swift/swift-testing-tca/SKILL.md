@@ -153,6 +153,13 @@ xcrun xcresulttool get test-results tests --path "$R"
 A `"result" : "Expected Failure"` node for a test with no visible line confirms
 this diagnosis. `await task.cancel()` turns it back into `Passed`.
 
+**`task.cancel()` asserts nothing on its own** — do not let it stand in for a
+check. A reducer that stops returning the effect still passes a test that only
+sends and cancels. If the point of the test is that the effect is running,
+assert it directly before cancelling: push through the spy's subject and
+`receive` the resulting action, or advance the `TestClock` past the interval and
+`receive` the timer's action.
+
 `await sut.store.finish()` remains correct for effects that *do* complete — it
 waits for them rather than declaring them unexamined.
 
@@ -166,6 +173,49 @@ noise rather than coverage.
 Do not turn it off globally, by habit, or to make a failing assertion pass. That
 discards the guarantee that makes `TestStore` worth using: every state mutation
 and every received action is accounted for.
+
+### Shared State: One Isolated Instance Per Test
+
+A dependency that is an object holding persisted `@Shared` properties
+(`.fileStorage`, `.appStorage`) leaks state between parallel tests when every
+test resolves it from `static let testValue = Store()`. That is one instance
+for the whole process, so one test's writes appear in another. Don't paper
+over it with `.serialized`. Give each test its own instance, built over fresh
+backing storage:
+
+```swift
+private func createSut(
+    prepareState: ((inout MyFeature.State) -> Void)? = nil
+) -> SystemUnderTests {
+    let settingsStore = withDependencies {
+        $0.defaultFileStorage = .inMemory                                  // for .fileStorage keys
+        $0.defaultAppStorage = UserDefaults(suiteName: UUID().uuidString)! // for .appStorage keys
+    } operation: {
+        SettingsStore()
+    }
+
+    return withDependencies {
+        $0.settingsStore = settingsStore
+    } operation: {
+        // State.init may read the dependency — build it inside the override
+        var initialState = MyFeature.State()
+        prepareState?(&initialState)
+        let store = TestStore(initialState: initialState) {
+            MyFeature()
+        } withDependencies: {
+            $0.settingsStore = settingsStore
+        }
+        return .init(store: store, settingsStore: settingsStore)
+    }
+}
+```
+
+Seed and assert through the instance on the SUT:
+
+```swift
+sut.settingsStore.$value.withLock { $0 = .fixture }
+#expect(sut.settingsStore.value == nil)
+```
 
 ### Porting From XCTest
 
@@ -197,6 +247,7 @@ port is not a rewrite of the test logic.
 | Wait for effects that finish | `await sut.store.finish()` |
 | End an effect that never finishes | hold the `TestStoreTask`, `await task.cancel()` |
 | Relax assertions | `sut.store.exhaustivity = .off` — only when required |
+| Isolate a dependency that holds persisted `@Shared` state | Build it in `createSut` under fresh `defaultFileStorage` / `defaultAppStorage`, inject it, expose it on the SUT |
 
 ## Common Mistakes
 
@@ -205,8 +256,11 @@ port is not a rewrite of the test logic.
 | `@MainActor` on `createSut` only | Put it on the `@Suite` type — otherwise the non-`Sendable` SUT crosses an isolation boundary on the way back |
 | `@MainActor` on some tests but not others | Annotate the suite once; per-test isolation drifts silently |
 | `skipInFlightEffects` to quiet a live effect | `await task.cancel()` — skipping records a known issue and the test vanishes from the output |
+| Send + `task.cancel()` as the whole test of a long-running effect | Cancel only ends it — first drive the spy subject or `TestClock` and `receive` the action the effect produces |
 | Trusting the runner's `✔` count | A missing `Suite … passed` line means results were swallowed; check the `.xcresult` |
 | `exhaustivity = .off` to quiet a failure | Fix the assertion; the failure is the point |
+| `.serialized` because parallel tests see each other's persisted `@Shared` values | They share the one `testValue` instance — build a fresh instance per test over new storage (see Shared State) |
+| Reading a shared-state dependency via `@Dependency` in the test body | That resolves to the process-wide `testValue` — use the instance exposed on the SUT |
 | `@Test(arguments:)` | Parameterized tests silently never run here — use a local `arguments` array and a `for` loop in the test body |
 | Reaching for `XCTestCase` after a segfault | Check the target links `IssueReportingTestSupport` first |
 | `Cannot find type 'LocalizedError'` after porting | Add `import Foundation` — `import XCTest` provided it transitively, `import Testing` does not |
