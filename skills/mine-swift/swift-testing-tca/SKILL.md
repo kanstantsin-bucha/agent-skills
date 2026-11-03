@@ -1,6 +1,6 @@
 ---
 name: swift-testing-tca
-description: Use when writing, porting, or reviewing TCA TestStore tests under Swift Testing (@Suite/@Test) — covers target setup, suite isolation, send/receive assertions, long-running effects, and exhaustivity. Also use when a TestStore test crashes with EXC_BAD_ACCESS, SIGSEGV, or "Test crashed with signal segv" with no assertion message and no crash report, or when a test silently vanishes from the runner output while the suite still reports success.
+description: Use when writing, porting, or reviewing TCA TestStore tests under Swift Testing (@Suite/@Test) — covers target setup, suite isolation, send/receive assertions, long-running effects, shared @Shared/fileStorage/appStorage state between tests, and exhaustivity. Also use when a TestStore test crashes with EXC_BAD_ACCESS, SIGSEGV, or "Test crashed with signal segv" with no assertion message and no crash report, or when a test silently vanishes from the runner output while the suite still reports success.
 ---
 
 # Testing TCA Features With Swift Testing
@@ -11,6 +11,17 @@ any other test in this repo — there is no need to fall back to `XCTestCase`.
 **REQUIRED SKILL:** `swift-testing-sut` for the `SystemUnderTests` / `createSut`
 structure. **REQUIRED SKILL:** `swift-testing-spy` when the feature has
 dependencies to stub.
+
+## Load The Reference That Matches
+
+Read the file before writing or fixing the test when its condition applies:
+
+| Read | When |
+|---|---|
+| [references/shared-state.md](references/shared-state.md) | The feature depends on an object holding persisted `@Shared` (`.fileStorage`, `.appStorage`); tests see each other's values; you're tempted to add `.serialized` |
+| [references/long-running-effects.md](references/long-running-effects.md) | An action starts a publisher, timer, or `AsyncStream`; the store complains about in-flight effects; a test is missing from the runner output |
+| [references/segfault-troubleshooting.md](references/segfault-troubleshooting.md) | `EXC_BAD_ACCESS` / signal segv inside `TestStore.init` with no assertion message |
+| [references/porting-from-xctest.md](references/porting-from-xctest.md) | Converting an `XCTestCase` to Swift Testing |
 
 ## Target Setup
 
@@ -27,8 +38,7 @@ dependencies: [
 ```
 
 Tuist prunes SPM products nothing references, so this is not built until a target
-names it. If it is missing, every `TestStore` test in the target segfaults — see
-Troubleshooting.
+names it. If it is missing, every `TestStore` test in the target segfaults.
 
 ## Writing The Test
 
@@ -83,12 +93,6 @@ struct MyFeatureTests {
 `@Suite` type, not on individual members — one annotation then covers every
 `@Test`, `createSut`, and any private helper that touches the SUT.
 
-```swift
-@Suite
-@MainActor
-struct MyFeatureTests { ... }
-```
-
 Per-member annotation is the trap. The moment a nonisolated helper receives the
 `SystemUnderTests` struct back from a `@MainActor createSut`, a non-`Sendable`
 `TestStoreOf<Feature>` crosses an isolation boundary. It compiles only because of
@@ -105,63 +109,10 @@ already have.
 
 Once the suite is isolated, `createSut` is a synchronous call from a
 main-actor context: write `let sut = createSut()`, not `await createSut()`.
-The `await` is only required while the test body is nonisolated, and the
-compiler warns about it here.
 
 `@MainActor` is not `.serialized`. Tests still start concurrently and interleave
-at every `await` — suites with long suspensions overlap exactly as before. If you
-need true one-at-a-time execution, that is the `.serialized` trait.
-
-### Long-Running Effects: Cancel The Task
-
-When an action starts an effect that never completes on its own — a `.publisher`
-subscription, a timer, an `AsyncStream` — hold the `TestStoreTask` that `send`
-returns and cancel it. That is what the view's `.task` modifier does on dismissal,
-so the test models the real lifecycle:
-
-```swift
-let task = await sut.store.send(.internal(.task))
-
-await sut.store.receive(\.internal.stateChanges) { $0.items = [...] }
-
-await task.cancel()
-```
-
-**Never reach for `skipInFlightEffects` to satisfy the store.** It looks like the
-tidy way to say "I'm done with the leftovers," and under Swift Testing it makes
-the test disappear:
-
-`skipInFlightEffects` finds a live effect, and reports it through
-`reportIssueHelper(overrideExhaustivity: .off(showSkippedAssertions: true))`,
-which wraps the report in `withExpectedIssue`. Under Swift Testing that resolves
-to `Testing.withKnownIssue`, so the test is recorded as **`Expected Failure`** —
-and xcbeautify prints no line at all for that result. The runner shows four `✔`
-for a six-test suite, omits the `Suite … passed` line, and still exits
-`Test Succeeded`. Nothing hangs and nothing is skipped; the result is simply
-invisible.
-
-Under XCTest the same code took the `XCTExpectFailure` branch, which the
-formatter *does* print — which is why this only surfaces after a port.
-
-**Confirming it:** the runner output is not authoritative. Read the result bundle:
-
-```bash
-R=$(ls -td ~/Library/Developer/Xcode/DerivedData/*/Logs/Test/*.xcresult | head -1)
-xcrun xcresulttool get test-results tests --path "$R"
-```
-
-A `"result" : "Expected Failure"` node for a test with no visible line confirms
-this diagnosis. `await task.cancel()` turns it back into `Passed`.
-
-**`task.cancel()` asserts nothing on its own** — do not let it stand in for a
-check. A reducer that stops returning the effect still passes a test that only
-sends and cancels. If the point of the test is that the effect is running,
-assert it directly before cancelling: push through the spy's subject and
-`receive` the resulting action, or advance the `TestClock` past the interval and
-`receive` the timer's action.
-
-`await sut.store.finish()` remains correct for effects that *do* complete — it
-waits for them rather than declaring them unexamined.
+at every `await`. If you need true one-at-a-time execution, that is the
+`.serialized` trait.
 
 ### Exhaustivity
 
@@ -173,65 +124,6 @@ noise rather than coverage.
 Do not turn it off globally, by habit, or to make a failing assertion pass. That
 discards the guarantee that makes `TestStore` worth using: every state mutation
 and every received action is accounted for.
-
-### Shared State: One Isolated Instance Per Test
-
-A dependency that is an object holding persisted `@Shared` properties
-(`.fileStorage`, `.appStorage`) leaks state between parallel tests when every
-test resolves it from `static let testValue = Store()`. That is one instance
-for the whole process, so one test's writes appear in another. Don't paper
-over it with `.serialized`. Give each test its own instance, built over fresh
-backing storage:
-
-```swift
-private func createSut(
-    prepareState: ((inout MyFeature.State) -> Void)? = nil
-) -> SystemUnderTests {
-    let settingsStore = withDependencies {
-        $0.defaultFileStorage = .inMemory                                  // for .fileStorage keys
-        $0.defaultAppStorage = UserDefaults(suiteName: UUID().uuidString)! // for .appStorage keys
-    } operation: {
-        SettingsStore()
-    }
-
-    return withDependencies {
-        $0.settingsStore = settingsStore
-    } operation: {
-        // State.init may read the dependency — build it inside the override
-        var initialState = MyFeature.State()
-        prepareState?(&initialState)
-        let store = TestStore(initialState: initialState) {
-            MyFeature()
-        } withDependencies: {
-            $0.settingsStore = settingsStore
-        }
-        return .init(store: store, settingsStore: settingsStore)
-    }
-}
-```
-
-Seed and assert through the instance on the SUT:
-
-```swift
-sut.settingsStore.$value.withLock { $0 = .fixture }
-#expect(sut.settingsStore.value == nil)
-```
-
-### Porting From XCTest
-
-| From | To |
-|---|---|
-| `final class X_Tests: XCTestCase` | `@Suite @MainActor struct XTests` |
-| `func test_foo_bar()` | `@Test("human readable description") func foo_bar()` |
-| `XCTAssertEqual(a, b)` | `#expect(a == b)` |
-| `XCTAssertNil(a)` / `XCTAssertTrue(a)` / `XCTAssertFalse(a)` | `#expect(a == nil)` / `#expect(a)` / `#expect(!a)` |
-
-`import XCTest` pulls in Foundation transitively; `import Testing` does not. Any
-file declaring `LocalizedError` stubs, using `Date`, `URL`, `Data`, etc. needs an
-explicit `import Foundation` added during the port.
-
-Preserve every assertion and the `// Given` / `// When` / `// Then` structure. A
-port is not a rewrite of the test logic.
 
 ## Quick Reference
 
@@ -245,63 +137,18 @@ port is not a rewrite of the test logic.
 | Assert an effect's action | `await sut.store.receive(.output(.confirmed))` |
 | Assert a state change | trailing closure on `send`/`receive` |
 | Wait for effects that finish | `await sut.store.finish()` |
-| End an effect that never finishes | hold the `TestStoreTask`, `await task.cancel()` |
+| End an effect that never finishes | hold the `TestStoreTask`, `await task.cancel()` — see long-running-effects |
 | Relax assertions | `sut.store.exhaustivity = .off` — only when required |
-| Isolate a dependency that holds persisted `@Shared` state | Build it in `createSut` under fresh `defaultFileStorage` / `defaultAppStorage`, inject it, expose it on the SUT |
+| Isolate persisted `@Shared` state | fresh instance per test — see shared-state |
 
 ## Common Mistakes
 
 | Mistake | Fix |
 |---|---|
-| `@MainActor` on `createSut` only | Put it on the `@Suite` type — otherwise the non-`Sendable` SUT crosses an isolation boundary on the way back |
-| `@MainActor` on some tests but not others | Annotate the suite once; per-test isolation drifts silently |
-| `skipInFlightEffects` to quiet a live effect | `await task.cancel()` — skipping records a known issue and the test vanishes from the output |
-| Send + `task.cancel()` as the whole test of a long-running effect | Cancel only ends it — first drive the spy subject or `TestClock` and `receive` the action the effect produces |
-| Trusting the runner's `✔` count | A missing `Suite … passed` line means results were swallowed; check the `.xcresult` |
+| `@MainActor` on `createSut` only, or on some tests but not others | Put it on the `@Suite` type once |
+| `skipInFlightEffects` to quiet a live effect | `await task.cancel()` — skipping makes the test vanish from the output (long-running-effects) |
+| Trusting the runner's `✔` count | A missing `Suite … passed` line means results were swallowed; check the `.xcresult` (long-running-effects) |
 | `exhaustivity = .off` to quiet a failure | Fix the assertion; the failure is the point |
-| `.serialized` because parallel tests see each other's persisted `@Shared` values | They share the one `testValue` instance — build a fresh instance per test over new storage (see Shared State) |
-| Reading a shared-state dependency via `@Dependency` in the test body | That resolves to the process-wide `testValue` — use the instance exposed on the SUT |
+| `.serialized` because parallel tests see each other's persisted values | Build a fresh instance per test (shared-state) |
 | `@Test(arguments:)` | Parameterized tests silently never run here — use a local `arguments` array and a `for` loop in the test body |
-| Reaching for `XCTestCase` after a segfault | Check the target links `IssueReportingTestSupport` first |
-| `Cannot find type 'LocalizedError'` after porting | Add `import Foundation` — `import XCTest` provided it transitively, `import Testing` does not |
-
-## Troubleshooting: TestStore Segfault
-
-**Symptoms:** `EXC_BAD_ACCESS` / `KERN_INVALID_ADDRESS` at a small address (e.g.
-`0x1f0`) inside `TestStore.init`, before any `send`. No assertion message, no
-crash report surfaced by the runner, which may silently relaunch the suite in a
-loop. Pure-value tests in the same suite pass. The same assertions pass under
-`XCTestCase`. Reproduces with a single test, no parallelism.
-
-**Cause:** the target does not link `IssueReportingTestSupport`. `TestStore.init`
-→ `SharedChangeTracker.track` → `CachedValues.CacheKey.init` → `TestContext.current`
-→ `IssueReporting._currentTest()`, which `dlsym`s a symbol from that dylib. When
-the lookup fails, DEBUG builds fall back to a hand-maintained replica of Swift
-Testing's internal `Test` struct filled via `unsafeBitCast`; a layout mismatch
-makes ARC's outlined destroy release a field at a wrong offset. XCTest is immune
-only because `Test.current` is `nil` there, so the replica is never built — which
-is why porting to `XCTestCase` appears to "fix" it while hiding the real cause.
-
-**Fix:** add the dependency (see Target Setup), `make generate_sim`, then verify:
-
-```bash
-grep -o 'IssueReportingTestSupport.framework' \
-  Projects/<Path>/<Name>.xcodeproj/project.pbxproj
-```
-
-**Does not help** — all tried, crash survived: `@MainActor` on the suite or test
-(correct for other reasons, see above, but irrelevant here), `await store.finish()`,
-`exhaustivity = .off`, `@Suite(.serialized)`.
-
-**Confirming a fresh crash.** The runner prints nothing useful, so read the real
-backtrace rather than guessing:
-
-```bash
-ls -t ~/Library/Logs/DiagnosticReports/xctest-*.ips | head -1
-```
-
-The `.ips` is JSON-lines: a metadata line, then the body. Parse
-`body['threads'][body['faultingThread']]['frames']` and map each `imageIndex`
-through `body['usedImages']` for symbol names. Frames reading
-`outlined destroy of Test?` → `_swift_release_dealloc` confirm this diagnosis;
-anything else is a different bug.
+| Reaching for `XCTestCase` after a segfault | Check the target links `IssueReportingTestSupport` (segfault-troubleshooting) |
